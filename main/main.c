@@ -127,15 +127,15 @@ void draw_llama(void)
 
 void app_main(void)
 {
-    init_display();
-    write_display("Loading Model");
+    // init_display();
+    // write_display("Loading Model");
     init_storage();
 
     // default parameters
     char *checkpoint_path = "/data/stories260K.bin"; // e.g. out/model.bin
     char *tokenizer_path = "/data/tok512.bin";
     float temperature = 1.0f;        // 0.0 = greedy deterministic. 1.0 = original. don't set higher
-    float topp = 0.9f;               // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
+    float topp = 1.0f;               // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
     int steps = 256;                 // number of steps to run for
     char *prompt = NULL;             // prompt string
     unsigned long long rng_seed = 0; // seed rng with time by default
@@ -157,9 +157,14 @@ void app_main(void)
 
     // build the Sampler
     Sampler sampler;
+    ESP_LOGI(TAG, "temperature is %f", temperature);
+
     build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
 
+    ESP_LOGI(TAG, "sampler temperature is %f, %f", (&sampler)->temperature, temperature);
     // run!
-    draw_llama();
+    // draw_llama();
     generate(&transformer, &tokenizer, &sampler, prompt, steps, &generate_complete_cb);
+
+    ESP_LOGI(TAG, "Reached the end of generation");
 }

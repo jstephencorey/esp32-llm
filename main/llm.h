@@ -115,6 +115,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
 void free_sampler(Sampler* sampler);
 void free_transformer(Transformer* t);
 void free_tokenizer(Tokenizer* t);
+v4sf broadcast_float(float x);
 
 
 #endif

@@ -175,7 +175,7 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights *weigh
     // negative vocab size is hacky way of signaling unshared weights. bit yikes.
     int shared_weights = config->vocab_size > 0 ? 1 : 0;
     config->vocab_size = abs(config->vocab_size);
-    ESP_LOGI(TAG, "Vocab size if %d", config->vocab_size);
+    ESP_LOGI(TAG, "Vocab size is %d", config->vocab_size);
     // figure out the file size
     fseek(file, 0, SEEK_END); // move file pointer to end of file
     *file_size = ftell(file); // get the file size, in bytes
@@ -689,6 +689,7 @@ void safe_printf(char *piece)
             return; // bad byte, don't print it
         }
     }
+    // ESP_LOGI(TAG, "Safe printing piece = %s", piece);
     printf("%s", piece);
 }
 
@@ -867,16 +868,28 @@ int sample_mult(v4sf *probabilities, int n, v4sf coin)
 {
     // sample index from probabilities (they must sum to 1!)
     // coin is a random number in [0, 1), usually from random_f32()
-    v4sf cdf = 0.0f;
+    // float temp[4];
+    // memcpy(temp, &coin, sizeof(v4sf));
+    // ESP_LOGI(TAG, "coin: [%f, %f, %f, %f]", temp[0], temp[1], temp[2], temp[3]);
+    v4sf cdf = broadcast_float(0.0f);
     for (int i = 0; i < n; i++)
     {
         cdf += probabilities[i];
+        // ESP_LOGI(TAG, "%d prob: %f, summed cdf: %f / %f", i, probabilities[i], cdf, coin);
         if (coin < cdf)
         {
             return i;
         }
     }
-    return n - 1; // in case of rounding errors
+    ESP_LOGI(TAG, "Encountered rounding errors, %f, %f", cdf, coin);
+    float temp[4];
+    // temp[4];
+    memcpy(temp, &coin, sizeof(v4sf));
+    ESP_LOGI(TAG, "coin: [%f, %f, %f, %f]", temp[0], temp[1], temp[2], temp[3]);
+    memcpy(temp, &cdf, sizeof(v4sf));
+    ESP_LOGI(TAG, "cdf: [%f, %f, %f, %f]", temp[0], temp[1], temp[2], temp[3]);
+    // return n - 1; // in case of rounding errors
+    return n + 10; //testing the real range
 }
 
 int compare(const void *a, const void *b)
@@ -940,10 +953,12 @@ int sample_topp(v4sf *probabilities, int n, v4sf topp, ProbIndex *probindex, v4s
     return probindex[last_idx].index; // in case of rounding errors
 }
 
-void build_sampler(Sampler *sampler, int vocab_size, v4sf temperature, v4sf topp, unsigned long long rng_seed)
+void build_sampler(Sampler *sampler, int vocab_size, float temperature, float topp, unsigned long long rng_seed)
 {
     sampler->vocab_size = vocab_size;
+    ESP_LOGI(TAG, "1. sampler temperature is %f, %f", (sampler)->temperature, temperature);
     sampler->temperature = temperature;
+    ESP_LOGI(TAG, "2. sampler temperature is %f, %f", (sampler)->temperature, temperature);
     sampler->topp = topp;
     sampler->rng_state = rng_seed;
     // buffer only used with nucleus sampling; may not need but it's ~small
@@ -969,36 +984,63 @@ v4sf random_f32(unsigned long long *state)
     return (random_u32(state) >> 8) / 16777216.0f;
 }
 
+v4sf broadcast_float(float x) {
+    return (v4sf){x, x, x, x};
+}
+
 int sample(Sampler *sampler, v4sf *logits)
 {
     // sample the token given the logits and some hyperparameters
     int next;
-    if (sampler->temperature == 0.0f)
+    if (sampler->temperature == 0.0f || sampler-> temperature < 0.001f)
     {
         // greedy argmax sampling: take the token with the highest probability
+        // ESP_LOGI(TAG, "argmax sampling");
         next = sample_argmax(logits, sampler->vocab_size);
     }
     else
     {
+        // ESP_LOGI(TAG, "Logits pre temperature %f:", sampler->temperature);
+        // for (int i = 0; i < 10; i++)
+        // {
+        //     ESP_LOGI(TAG, "logit %d value: %f", i, logits[i]);
+        // }
         // apply the temperature to the logits
         for (int q = 0; q < sampler->vocab_size; q++)
         {
-            logits[q] /= sampler->temperature;
+            logits[q] /= broadcast_float(sampler->temperature);
         }
         // apply softmax to the logits to get the probabilities for next token
+        // ESP_LOGI(TAG, "Logits before softmax:");
+        // ESP_LOGI(TAG, "Logits pre softmax:");
+        // for (int i = 0; i < 10; i++)
+        // {
+        //     ESP_LOGI(TAG, "logit %d value: %f", i, logits[i]);
+        // }
         softmax(logits, sampler->vocab_size);
+        // ESP_LOGI(TAG, "Logits post softmax:");
+        // for (int i = 0; i < 10; i++)
+        // {
+        //     ESP_LOGI(TAG, "logit %d value: %f", i, logits[i]);
+        // }
         // flip a (v4sf) coin (this is our source of entropy for sampling)
         v4sf coin = random_f32(&sampler->rng_state);
+        // coin = broadcast_float((float)coin);
+        while (coin > 1.0) {
+            coin -= 1;
+        }
         // we sample from this distribution to get the next token
         if (sampler->topp <= 0 || sampler->topp >= 1)
         {
             // simply sample from the predicted probability distribution
+            // ESP_LOGI(TAG, "multi sampling");
             next = sample_mult(logits, sampler->vocab_size, coin);
         }
         else
         {
             // top-p (nucleus) sampling, clamping the least likely tokens to zero
-            next = sample_topp(logits, sampler->vocab_size, sampler->topp, sampler->probindex, coin);
+            ESP_LOGI(TAG, "topp sampling - currently fails");
+            next = sample_topp(logits, sampler->vocab_size, broadcast_float(sampler->topp), sampler->probindex, coin);
         }
     }
     return next;
@@ -1020,7 +1062,8 @@ long time_in_ms()
 
 void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps, generated_complete_cb cb_done)
 {
-    char *empty_prompt = "";
+    ESP_LOGI(TAG, "Beginning Generation:");
+    char *empty_prompt = "Once upon a time,";
     if (prompt == NULL)
     {
         prompt = empty_prompt;
@@ -1035,7 +1078,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         ESP_LOGE(TAG, "something is wrong, expected at least 1 prompt token");
         exit(EXIT_FAILURE);
     }
-
+    ESP_LOGI(TAG, "Starting the main generation loop:");
     // start the main loop
     long start = 0;               // used to time our code, only initialized after first iteration
     int next;                     // will store the next token in the sequence
@@ -1045,7 +1088,11 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     {
         // forward the transformer to get logits for the next token
         v4sf *logits = forward(transformer, token, pos);
-
+        // ESP_LOGI(TAG, "Logits:");
+        // for (int i = 0; i < 10; i++)
+        // {
+        //     ESP_LOGI(TAG, "logit %d value: %f", i, logits[i]);
+        // }
         // advance the state machine
         if (pos < num_prompt_tokens - 1)
         {
@@ -1069,6 +1116,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         char *piece = decode(tokenizer, token, next);
         safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
         fflush(stdout);
+        // ESP_LOGI(TAG, "Another token generated %s, %d, %d", piece, token, next);    
         token = next;
 
         // init the timer here because the first iteration can be slower
@@ -1085,11 +1133,11 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         long end = time_in_ms();
         float tks = (pos - 1) / (double)(end - start) * 1000;
         fprintf(stderr, "achieved tok/s: %f\n", tks);
-        cb_done(tks);
+        // cb_done(tks);
     }
-
-    free(prompt_tokens);
     ESP_LOGI(TAG, "Generate complete");
+    free(prompt_tokens);
+    ESP_LOGI(TAG, "Generate completely complete");
 }
 
 void read_stdin(const char *guide, char *buffer, size_t bufsize)
